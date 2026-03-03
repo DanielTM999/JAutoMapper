@@ -75,6 +75,11 @@ public class AutoMapperService implements AutoMapper {
         return autoMapperService;
     }
 
+
+    public static AutoMapper getOrRegister(Class<?> source, Class<?> target) {
+       return getOrRegister(source, target, null);
+    }
+
     public static AutoMapper getOrRegister(Class<?> source, Class<?> target, Consumer<MappingProfile> mappingProfileConsumer) {
         if (source == null) {
             throw new MappingException("Source type cannot be null");
