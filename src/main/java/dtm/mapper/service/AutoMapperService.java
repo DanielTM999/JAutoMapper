@@ -122,7 +122,7 @@ public class AutoMapperService implements AutoMapper {
 
         Collection<?> target = createCollectionFromType(targetClass);
 
-        mapNode(source, target, source.getClass(), targetClass, targetTypeGeneric);
+        mapNode(source, source, target, source.getClass(), targetClass, targetTypeGeneric);
 
         return (T)target;
     }
