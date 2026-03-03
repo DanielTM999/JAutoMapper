@@ -23,7 +23,10 @@ public class AutoMapperService implements AutoMapper {
 
     private final DefaultMappingProfile mappingProfile;
     private final AtomicBoolean ignoredFieldsLoaded;
+    private final AtomicBoolean customMatterFieldsLoaded;
+
     private final Set<Field> ignoredFields;
+    private final Map<Field, String> customMapperFields;
 
     public static AutoMapper register(Class<?> source, Class<?> target) {
         return register(source, target, null);
@@ -73,7 +76,9 @@ public class AutoMapperService implements AutoMapper {
     protected AutoMapperService(DefaultMappingProfile mappingProfile) {
         this.mappingProfile = mappingProfile;
         this.ignoredFieldsLoaded = new AtomicBoolean(false);
+        this.customMatterFieldsLoaded =  new AtomicBoolean(false);
         this.ignoredFields = new HashSet<>();
+        this.customMapperFields = new HashMap<>();
     }
 
 
@@ -81,11 +86,13 @@ public class AutoMapperService implements AutoMapper {
     public <T> T map(Object source, Class<T> targetType) {
         validTargetType(targetType);
         validSource(source);
+
         if(ignoredFieldsLoaded.compareAndSet(false, true)) searchIgnorableFields(targetType);
+        if(customMatterFieldsLoaded.compareAndSet(false, true)) searchCustomMapperFields(targetType);
 
         T target = createInstanceForElement(targetType);
 
-        mapNode(source, target, source.getClass(), targetType);
+        mapNode(source, source, target, source.getClass(), targetType);
 
         return target;
     }
@@ -244,6 +251,53 @@ public class AutoMapperService implements AutoMapper {
         this.ignoredFields.add(field);
     }
 
+
+    private void searchCustomMapperFields(Class<?> target) {
+        Map<String, String> ignoredFieldsStr = mappingProfile.getMappings();
+
+        ignoredFieldsStr.forEach((k, v) -> {
+            searchCustomMapperFieldByName(k, v, target);
+        });
+    }
+
+    private void searchCustomMapperFieldByName(String fieldNameRaw, String newFieldNameRaw, Class<?> target) {
+        String[] parts = fieldNameRaw.split("\\.");
+
+        Class<?> currentType = target;
+        Field field = null;
+
+        StringBuilder resolvedPath = new StringBuilder(target.getName());
+        Iterator<String> iter = Arrays.asList(parts).iterator();
+
+        while (iter.hasNext()) {
+            String part = iter.next();
+            field = findFieldInHierarchy(currentType, part);
+            if (field == null) {
+                throw new MappingException(
+                        "Ignored field not found: '" + part +
+                                "' while resolving path '" + fieldNameRaw +
+                                "' starting from type " + resolvedPath
+                );
+            }
+
+            field.setAccessible(true);
+            Class<?> fieldType = field.getType();
+
+            if (iter.hasNext()) {
+                validateNavigableField(field, fieldType);
+            }
+
+            resolvedPath.append(".").append(part);
+            currentType = fieldType;
+        }
+
+        this.customMapperFields.put(field, newFieldNameRaw);
+    }
+
+
+
+
+
     private Field findFieldInHierarchy(Class<?> type, String fieldName) {
         if (type == null) {
             return null;
@@ -292,15 +346,17 @@ public class AutoMapperService implements AutoMapper {
 
 
     private Object mapNode(
+            Object rootSource,
             Object sourceNode,
             Object targetNode,
             Class<?> sourceType,
             Class<?> targetType
     ){
-        return mapNode(sourceNode, targetNode, sourceType, targetType, null);
+        return mapNode(rootSource, sourceNode, targetNode, sourceType, targetType, null);
     }
 
     private Object mapNode(
+            Object rootSource,
             Object sourceNode,
             Object targetNode,
             Class<?> sourceType,
@@ -310,15 +366,15 @@ public class AutoMapperService implements AutoMapper {
         NodeKind kind = resolveKind(targetType);
 
         switch (kind) {
-            case OBJECT -> mapObject(sourceNode, targetNode);
+            case OBJECT -> mapObject(rootSource, sourceNode, targetNode);
             case MAP -> mapMap(sourceNode, targetNode);
-            case COLLECTION -> mapCollection(sourceNode, targetNode, targetTypeGeneric);
+            case COLLECTION -> mapCollection(rootSource, sourceNode, targetNode, targetTypeGeneric);
             case VALUE -> targetNode = assignValue(sourceNode, targetNode);
         }
         return targetNode;
     }
 
-    private void mapObject(Object source, Object target) {
+    private void mapObject(Object rootSource, Object source, Object target) {
         NodeKind sourceKind = resolveKind(source.getClass());
 
         List<Field> targetFields = getFieldsForClass(target.getClass());
@@ -326,14 +382,19 @@ public class AutoMapperService implements AutoMapper {
         for (Field targetField : targetFields) {
             if(ignoredFields.contains(targetField)) continue;
             try {
-                Object sourceValue = resolveSourceValue(source, sourceKind, targetField);
+                Object sourceValue;
+                if(customMapperFields.containsKey(targetField)) {
+                    sourceValue = resolveSourceValueByPath(rootSource, customMapperFields.get(targetField));
+                }else{
+                    sourceValue = resolveSourceValue(source, sourceKind, targetField);
+                }
 
                 if (sourceValue == MISSING) {
                     sourceValue = handleMissingFieldPolicy(targetField);
                 }
                 if (sourceValue == MISSING) continue;
                 sourceValue = handleNullValuePolicy(sourceValue, targetField);
-                assignResolvedValue(sourceValue, target, targetField);
+                assignResolvedValue(rootSource, sourceValue, target, targetField);
             }catch (Exception e) {
                 throw new MappingException(
                         "Error mapping field: " + targetField.getName(),
@@ -345,18 +406,18 @@ public class AutoMapperService implements AutoMapper {
 
     private void mapMap(Object source, Object target) {}
 
-    private void mapCollection(Object source, Object target, Class<?> targetGenericType) {
+    private void mapCollection(Object rootSource, Object source, Object target, Class<?> targetGenericType) {
         if (source == null) return;
         Class<?> sourceClass = source.getClass();
         Class<?> targetType = target.getClass();
 
         try{
             if(sourceClass.isArray()){
-                assignArraySourceValueRoot(source, target, targetGenericType);
+                assignArraySourceValueRoot(rootSource, source, target, targetGenericType);
             }else if(Collection.class.isAssignableFrom(sourceClass)){
-                assignCollectionSourceValueRoot(source, target, targetGenericType);
+                assignCollectionSourceValueRoot(rootSource, source, target, targetGenericType);
             }else if(source instanceof Map<?,?> map){
-                assignCollectionSourceValueRoot(map.values(), target, targetGenericType);
+                assignCollectionSourceValueRoot(rootSource, map.values(), target, targetGenericType);
             }
         }catch (Exception e) {
             throw new MappingException(
@@ -452,7 +513,7 @@ public class AutoMapperService implements AutoMapper {
         };
     }
 
-    private void assignResolvedValue(Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
+    private void assignResolvedValue(Object rootSource, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
         NodeKind targetKind = resolveKind(targetField.getType());
 
         targetField.setAccessible(true);
@@ -474,6 +535,7 @@ public class AutoMapperService implements AutoMapper {
                 }
 
                 mapNode(
+                        rootSource,
                         sourceValue,
                         targetValue,
                         sourceValue.getClass(),
@@ -489,20 +551,20 @@ public class AutoMapperService implements AutoMapper {
             }
 
             case COLLECTION -> {
-                assignCollectionValue(sourceValue, target, targetField);
+                assignCollectionValue(rootSource, sourceValue, target, targetField);
             }
         }
     }
 
 
-    private void assignCollectionValue(Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
+    private void assignCollectionValue(Object rootSource, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
         if (sourceValue == null) return;
         Class<?> sourceClass = sourceValue.getClass();
 
         if(sourceClass.isArray()){
-            assignArraySourceValue(sourceValue, target, targetField);
+            assignArraySourceValue(rootSource, sourceValue, target, targetField);
         }else if(Collection.class.isAssignableFrom(sourceClass)){
-            assignCollectionSourceValue(sourceValue, target, targetField);
+            assignCollectionSourceValue(rootSource, sourceValue, target, targetField);
         }else{
             throw new MappingException(
                     "Source value for field '" + targetField.getName() + "' is neither an array nor a collection. Found type: " + sourceClass.getName()
@@ -513,7 +575,7 @@ public class AutoMapperService implements AutoMapper {
 
 
 
-    private void assignArraySourceValue(Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
+    private void assignArraySourceValue(Object rootSource, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
         if (sourceValue == null) return;
 
         int length = Array.getLength(sourceValue);
@@ -522,10 +584,10 @@ public class AutoMapperService implements AutoMapper {
             sourceCollection.add(Array.get(sourceValue, i));
         }
 
-        assignCollectionSourceValue(sourceCollection, target, targetField);
+        assignCollectionSourceValue(rootSource, sourceCollection, target, targetField);
     }
 
-    private void assignCollectionSourceValue(Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
+    private void assignCollectionSourceValue(Object rootSource, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
         if (!(sourceValue instanceof Collection<?> sourceCollection)) return;
 
         Class<?> targetType = targetField.getType();
@@ -541,7 +603,7 @@ public class AutoMapperService implements AutoMapper {
             int i = 0;
             for (Object elem : sourceCollection) {
                 if (elem != null) {
-                    Object mappedElem = mapCollectionElement(elem, sourceElementKind, targetComponentType);
+                    Object mappedElem = mapCollectionElement(rootSource, elem, sourceElementKind, targetComponentType);
                     Array.set(targetArray, i++, mappedElem);
                 }
             }
@@ -553,7 +615,7 @@ public class AutoMapperService implements AutoMapper {
             Collection<Object> targetCollection = createCollectionFromType(targetType);
             for (Object elem : sourceCollection) {
                 if (elem != null) {
-                    Object mappedElem = mapCollectionElement(elem, sourceElementKind, targetComponentType);
+                    Object mappedElem = mapCollectionElement(rootSource, elem, sourceElementKind, targetComponentType);
                     targetCollection.add(mappedElem);
                 }
             }
@@ -566,7 +628,7 @@ public class AutoMapperService implements AutoMapper {
 
 
 
-    private void assignArraySourceValueRoot(Object sourceValue, Object target, Class<?> targetComponentType){
+    private void assignArraySourceValueRoot(Object rootSource, Object sourceValue, Object target, Class<?> targetComponentType){
         if (sourceValue == null) return;
 
         int length = Array.getLength(sourceValue);
@@ -575,10 +637,10 @@ public class AutoMapperService implements AutoMapper {
             sourceCollection.add(Array.get(sourceValue, i));
         }
 
-        assignCollectionSourceValueRoot(sourceCollection, target, targetComponentType);
+        assignCollectionSourceValueRoot(rootSource, sourceCollection, target, targetComponentType);
     }
 
-    private void assignCollectionSourceValueRoot(Object sourceValue, Object target, Class<?> targetComponentType) {
+    private void assignCollectionSourceValueRoot(Object rootSource, Object sourceValue, Object target, Class<?> targetComponentType) {
         if (!(sourceValue instanceof Collection<?> sourceCollection)) return;
 
         Class<?> targetType = target.getClass();
@@ -588,7 +650,7 @@ public class AutoMapperService implements AutoMapper {
             int i = 0;
             for (Object elem : sourceCollection) {
                 if (elem != null) {
-                    Object mappedElem = mapCollectionElement(elem, sourceElementKind, targetComponentType);
+                    Object mappedElem = mapCollectionElement(rootSource, elem, sourceElementKind, targetComponentType);
                     Array.set(target, i++, mappedElem);
                 }
             }
@@ -599,7 +661,7 @@ public class AutoMapperService implements AutoMapper {
             Collection<Object> targetCollection = (Collection<Object>) target;
             for (Object elem : sourceCollection) {
                 if (elem != null) {
-                    Object mappedElem = mapCollectionElement(elem, sourceElementKind, targetComponentType);
+                    Object mappedElem = mapCollectionElement(rootSource, elem, sourceElementKind, targetComponentType);
                     targetCollection.add(mappedElem);
                 }
             }
@@ -611,11 +673,11 @@ public class AutoMapperService implements AutoMapper {
 
 
 
-    private Object mapCollectionElement(Object elem, NodeKind elementKind, Class<?> targetComponentType) {
+    private Object mapCollectionElement(Object rootSource, Object elem, NodeKind elementKind, Class<?> targetComponentType) {
         if (elementKind == NodeKind.VALUE) return elem;
 
         Object instanceObj = createInstanceForElement(targetComponentType);
-        return mapNode(elem, instanceObj, elem.getClass(), targetComponentType);
+        return mapNode(rootSource, elem, instanceObj, elem.getClass(), targetComponentType);
     }
 
 
@@ -740,6 +802,40 @@ public class AutoMapperService implements AutoMapper {
         throw new MappingException(
                 "Cannot determine parameterized type for element: " + element
         );
+    }
+
+    private Object resolveSourceValueByPath(Object source, String sourcePath) throws IllegalAccessException, NoSuchFieldException {
+        if (source == null) return null;
+
+        String[] parts = sourcePath.split("\\.");
+        Object current = source;
+        NodeKind sourceRootKind = resolveKind(source.getClass());
+        if (sourceRootKind != NodeKind.MAP && sourceRootKind != NodeKind.OBJECT) {
+            throw new MappingException(
+                    "Cannot access property path '" + sourcePath + "' on unsupported source type: "
+                            + (source != null ? source.getClass().getName() : "null")
+            );
+        }
+
+
+        for (String part : parts) {
+            if (current == null) return null;
+
+            if (current instanceof Map<?, ?> map) {
+                current = map.get(part);
+            }else {
+                Field field = findFieldInHierarchy(current.getClass(), part);
+                if (field == null) {
+                    throw new MappingException(
+                            "Field '" + part + "' not found in class " + current.getClass().getName()
+                    );
+                }
+                field.setAccessible(true);
+                current = field.get(current);
+            }
+        }
+
+        return current;
     }
 
     private record AutoMapperClassKey(Class<?> source, Class<?> target) {}

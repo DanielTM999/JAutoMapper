@@ -168,5 +168,44 @@ public class AutoMapperTest {
         assertTrue(target.contains("Charlie"));
     }
 
+    @Test
+    void shouldMapSimpleField() {
+        AutoMapper mapper = AutoMapperService.register(
+                Map.class,
+                Person.class,
+                profile -> {
+                    profile.map("name", "name");
+                }
+        );
 
+        Map<String, Object> source = new HashMap<>();
+        source.put("name", "Daniel");
+
+        Person target = mapper.map(source, Person.class);
+
+        assertNotNull(target);
+        assertEquals("Daniel", target.name);
+    }
+
+    @Test
+    void shouldMapNestedField() {
+        AutoMapper mapper = AutoMapperService.register(
+                Map.class,
+                Person.class,
+                profile -> {
+                    profile.map("address.street", "address.street"); // caminho aninhado
+                }
+        );
+
+        Map<String, Object> source = new HashMap<>();
+        Map<String, Object> addressMap = new HashMap<>();
+        addressMap.put("street", "Rua X");
+        source.put("address", addressMap);
+
+        Person target = mapper.map(source, Person.class);
+
+        assertNotNull(target);
+        assertNotNull(target.address);
+        assertEquals("Rua X", target.address.street);
+    }
 }
