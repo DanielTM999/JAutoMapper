@@ -75,6 +75,27 @@ public class AutoMapperService implements AutoMapper {
         return autoMapperService;
     }
 
+    public static AutoMapper getOrRegister(Class<?> source, Class<?> target, Consumer<MappingProfile> mappingProfileConsumer) {
+        if (source == null) {
+            throw new MappingException("Source type cannot be null");
+        }
+        if (target == null) {
+            throw new MappingException("Target type cannot be null");
+        }
+
+        AutoMapperClassKey key = new AutoMapperClassKey(source, target);
+
+        return MAPPERS.computeIfAbsent(key, k -> {
+            DefaultMappingProfile mappingProfile = new DefaultMappingProfile(target, source);
+
+            if (mappingProfileConsumer != null) {
+                mappingProfileConsumer.accept(mappingProfile);
+            }
+
+            return new AutoMapperService(mappingProfile);
+        });
+    }
+
 
     protected AutoMapperService(DefaultMappingProfile mappingProfile) {
         this.mappingProfile = mappingProfile;
