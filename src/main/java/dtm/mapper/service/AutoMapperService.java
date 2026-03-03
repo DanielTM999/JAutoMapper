@@ -447,6 +447,11 @@ public class AutoMapperService implements AutoMapper {
                 }
                 if (sourceValue == MISSING) continue;
                 sourceValue = handleNullValuePolicy(sourceValue, targetField);
+                if(converterFields.containsKey(targetField)) {
+                    @SuppressWarnings("unchecked")
+                    MapperConverter<Object, Object> converter = (MapperConverter<Object, Object>) converterFields.get(targetField);
+                    sourceValue = converter.convert(sourceValue);
+                }
                 assignResolvedValue(rootSource, sourceValue, target, targetField);
             }catch (Exception e) {
                 throw new MappingException(
