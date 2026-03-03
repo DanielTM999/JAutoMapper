@@ -107,6 +107,10 @@ public class DefaultMappingProfile implements MappingProfile {
         return (nullValuePolicy != null) ? nullValuePolicy : NullValuePolicy.IGNORE;
     }
 
+    public Map<String, MapperConverter<?, ?>> getFieldConverters(){
+        return fieldConverters;
+    }
+
     public Class<?> getTargetType() {
         return targetType;
     }

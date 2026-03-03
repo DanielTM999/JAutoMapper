@@ -3,6 +3,7 @@ package dtm.mapper.service;
 
 import dtm.mapper.AutoMapper;
 import dtm.mapper.CollectionReference;
+import dtm.mapper.MapperConverter;
 import dtm.mapper.MappingProfile;
 import dtm.mapper.enums.NodeKind;
 import dtm.mapper.exceptions.MappingException;
@@ -24,9 +25,11 @@ public class AutoMapperService implements AutoMapper {
     private final DefaultMappingProfile mappingProfile;
     private final AtomicBoolean ignoredFieldsLoaded;
     private final AtomicBoolean customMatterFieldsLoaded;
+    private final AtomicBoolean converterFieldsLoaded;
 
     private final Set<Field> ignoredFields;
     private final Map<Field, String> customMapperFields;
+    private final Map<Field, MapperConverter<?, ?>> converterFields;
 
     public static AutoMapper register(Class<?> source, Class<?> target) {
         return register(source, target, null);
@@ -77,8 +80,10 @@ public class AutoMapperService implements AutoMapper {
         this.mappingProfile = mappingProfile;
         this.ignoredFieldsLoaded = new AtomicBoolean(false);
         this.customMatterFieldsLoaded =  new AtomicBoolean(false);
+        this.converterFieldsLoaded = new AtomicBoolean(false);
         this.ignoredFields = new HashSet<>();
         this.customMapperFields = new HashMap<>();
+        this.converterFields = new HashMap<>();
     }
 
 
@@ -89,6 +94,7 @@ public class AutoMapperService implements AutoMapper {
 
         if(ignoredFieldsLoaded.compareAndSet(false, true)) searchIgnorableFields(targetType);
         if(customMatterFieldsLoaded.compareAndSet(false, true)) searchCustomMapperFields(targetType);
+        if(converterFieldsLoaded.compareAndSet(false, true)) searchConvertersFields(targetType);
 
         T target = createInstanceForElement(targetType);
 
@@ -118,7 +124,10 @@ public class AutoMapperService implements AutoMapper {
 
         validTargetType(targetClass);
         validSource(source);
+
         if(ignoredFieldsLoaded.compareAndSet(false, true)) searchIgnorableFields(targetTypeGeneric);
+        if(customMatterFieldsLoaded.compareAndSet(false, true)) searchCustomMapperFields(targetTypeGeneric);
+        if(converterFieldsLoaded.compareAndSet(false, true)) searchConvertersFields(targetTypeGeneric);
 
         Collection<?> target = createCollectionFromType(targetClass);
 
@@ -208,6 +217,8 @@ public class AutoMapperService implements AutoMapper {
         }
     }
 
+
+
     private void searchIgnorableFields(Class<?> target) {
         Set<String> ignoredFieldsStr = mappingProfile.getIgnoredFields();
 
@@ -295,6 +306,48 @@ public class AutoMapperService implements AutoMapper {
     }
 
 
+    private void searchConvertersFields(Class<?> target) {
+        Map<String, MapperConverter<?, ?>> fieldConverters = mappingProfile.getFieldConverters();
+
+        fieldConverters.forEach((s, converter) -> {
+            searchConverterFieldByName(s, target, converter);
+        });
+
+    }
+
+    private void searchConverterFieldByName(String fieldNameRaw, Class<?> target, MapperConverter<?, ?> converter) {
+        String[] parts = fieldNameRaw.split("\\.");
+
+        Class<?> currentType = target;
+        Field field = null;
+
+        StringBuilder resolvedPath = new StringBuilder(target.getName());
+        Iterator<String> iter = Arrays.asList(parts).iterator();
+
+        while (iter.hasNext()) {
+            String part = iter.next();
+            field = findFieldInHierarchy(currentType, part);
+            if (field == null) {
+                throw new MappingException(
+                        "Ignored field not found: '" + part +
+                                "' while resolving path '" + fieldNameRaw +
+                                "' starting from type " + resolvedPath
+                );
+            }
+
+            field.setAccessible(true);
+            Class<?> fieldType = field.getType();
+
+            if (iter.hasNext()) {
+                validateNavigableField(field, fieldType);
+            }
+
+            resolvedPath.append(".").append(part);
+            currentType = fieldType;
+        }
+
+        this.converterFields.put(field, converter);
+    }
 
 
 
