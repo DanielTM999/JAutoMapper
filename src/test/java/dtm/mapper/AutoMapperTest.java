@@ -30,6 +30,18 @@ public class AutoMapperTest {
         List<String> tags;
     }
 
+    public enum Status {
+        ACTIVE,
+        INACTIVE,
+        PENDING
+    }
+
+    public static class User {
+        String id;
+        String name;
+        Status status;
+    }
+
 
     @Test
     void shouldRunMappingFlowWithoutErrors() {
@@ -207,5 +219,48 @@ public class AutoMapperTest {
         assertNotNull(target);
         assertNotNull(target.address);
         assertEquals("Rua X", target.address.street);
+    }
+
+    @Test
+    void shouldMapEnumFromMap() {
+        // registra o mapeamento
+        AutoMapper mapper = AutoMapperService.register(
+                Map.class,
+                User.class
+        );
+
+        Map<String, Object> source = new HashMap<>();
+        source.put("id", "100");
+        source.put("name", "Daniel");
+        source.put("status", "ACTIVE");
+
+        // faz o mapeamento
+        User target = mapper.map(source, User.class);
+
+        // asserts
+        assertNotNull(target);
+        assertEquals("100", target.id);
+        assertEquals("Daniel", target.name);
+        assertEquals(Status.ACTIVE, target.status);
+    }
+
+    @Test
+    void shouldMapEnumDirectly() {
+        AutoMapper mapper = AutoMapperService.register(
+                User.class,
+                User.class
+        );
+
+        User source = new User();
+        source.id = "101";
+        source.name = "Alice";
+        source.status = Status.PENDING;
+
+        User target = mapper.map(source, User.class);
+
+        assertNotNull(target);
+        assertEquals("101", target.id);
+        assertEquals("Alice", target.name);
+        assertEquals(Status.PENDING, target.status);
     }
 }

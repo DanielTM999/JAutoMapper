@@ -598,13 +598,50 @@ public class AutoMapperService implements AutoMapper {
     }
 
     private void assignResolvedValue(Object rootSource, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
-        NodeKind targetKind = resolveKind(targetField.getType());
+        Class<?> fieldType = targetField.getType();
+        NodeKind targetKind = resolveKind(fieldType);
 
         targetField.setAccessible(true);
 
         switch (targetKind) {
 
             case VALUE -> {
+
+                if(fieldType.isEnum() && sourceValue != null){
+                    Class<? extends Enum> enumClass = (Class<? extends Enum>) fieldType;
+
+                    if (sourceValue instanceof Enum<?> sourceEnum) {
+                        if (sourceEnum.getClass() != enumClass) {
+                            try {
+                                sourceValue = Enum.valueOf(enumClass, sourceEnum.name());
+                            } catch (IllegalArgumentException e) {
+                                throw new MappingException(
+                                        "Não foi possível converter enum " + sourceEnum +
+                                                " para o tipo " + enumClass.getName(), e
+                                );
+                            }
+                        }
+                    } else if(sourceValue instanceof String enumString){
+                        try {
+                            sourceValue = Enum.valueOf(enumClass, enumString);
+                        } catch (IllegalArgumentException e) {
+                            throw new MappingException(
+                                    "Não foi possível converter " + enumString +
+                                            " para o tipo " + enumClass.getName(), e
+                            );
+                        }
+                    }else if(sourceValue instanceof Integer ordinal){
+                        Enum<?>[] constants = enumClass.getEnumConstants();
+                        if (ordinal >= 0 && ordinal < constants.length) {
+                            sourceValue = constants[ordinal];
+                        } else {
+                            throw new MappingException(
+                                    "Ordinal " + ordinal + " não válido para enum " + enumClass.getName()
+                            );
+                        }
+                    }
+                }
+
                 targetField.set(target, sourceValue);
             }
 
@@ -808,8 +845,11 @@ public class AutoMapperService implements AutoMapper {
             return NodeKind.COLLECTION;
         }
 
-        if (type.isPrimitive()
-                || type.getPackage() != null && type.getPackage().getName().startsWith("java.")
+        if (
+                type.isPrimitive() ||
+                type.isEnum() ||
+                type.getPackage() != null &&
+                type.getPackage().getName().startsWith("java.")
         ) {
             return NodeKind.VALUE;
         }
