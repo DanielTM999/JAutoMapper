@@ -449,7 +449,7 @@ public class AutoMapperService implements AutoMapper {
 
         switch (kind) {
             case OBJECT -> mapObject(rootSource, sourceNode, targetNode);
-            case MAP -> mapMap(sourceNode, targetNode);
+            case MAP -> mapMap(rootSource, sourceNode);
             case COLLECTION -> mapCollection(rootSource, sourceNode, targetNode, targetTypeGeneric);
             case VALUE -> targetNode = assignValue(sourceNode, targetNode);
         }
@@ -491,7 +491,38 @@ public class AutoMapperService implements AutoMapper {
         }
     }
 
-    private void mapMap(Object source, Object target) {}
+    private void mapMap(Object source, Object target) {
+        mapMap(source, target, null, null);
+    }
+
+    private void mapMap(Object source, Object target, Class<?> targetKeyType, Class<?> targetValueType) {
+        if (source == null || target == null) return;
+        if(!(target instanceof Map)) return;
+
+        Map<Object, Object> targetMap = (Map<Object, Object>) target;
+
+        if (source instanceof Map<?, ?> sourceMap) {
+            for (Map.Entry<?, ?> entry : sourceMap.entrySet()) {
+                Object key = coerceMapKey(entry.getKey(), targetKeyType);
+                Object value = mapMapValue(source, entry.getValue(), targetValueType);
+                targetMap.put(key, value);
+            }
+        }else{
+            List<Field> fields = getFieldsForClass(source.getClass());
+            for (Field field : fields) {
+                try {
+                    field.setAccessible(true);
+                    Object raw   = field.get(source);
+                    Object value = mapMapValue(source, raw, targetValueType);
+                    targetMap.put(field.getName(), value);
+                } catch (IllegalAccessException e) {
+                    throw new MappingException(
+                            "Error reading field '" + field.getName() + "' while mapping to Map", e
+                    );
+                }
+            }
+        }
+    }
 
     private void mapCollection(Object rootSource, Object source, Object target, Class<?> targetGenericType) {
         if (source == null) return;
@@ -668,10 +699,20 @@ public class AutoMapperService implements AutoMapper {
             }
 
             case MAP -> {
-                throw new MappingException(
-                        "MAP mapping not implemented yet for field: "
-                                + targetField.getName()
-                );
+                if (sourceValue == null) return;
+
+                Object targetValue = targetField.get(target);
+                if (targetValue == null) {
+                    targetValue = createInstanceForElement(fieldType);
+                    targetField.set(target, targetValue);
+                }
+
+
+                Class<?> keyType   = resolveMapGenericType(targetField, 0);
+                Class<?> valueType = resolveMapGenericType(targetField, 1);
+
+                mapMap(sourceValue, targetValue, keyType, valueType);
+
             }
 
             case COLLECTION -> {
@@ -963,6 +1004,63 @@ public class AutoMapperService implements AutoMapper {
         }
 
         return current;
+    }
+
+    private Object mapMapValue(Object rootSource, Object value, Class<?> targetValueType) {
+        if (value == null) return null;
+
+        Class<?> effectiveType = (targetValueType != null) ? targetValueType : value.getClass();
+        NodeKind kind = resolveKind(effectiveType);
+
+        return switch (kind) {
+            case VALUE -> value;
+
+            case OBJECT -> {
+                Object instance = createInstanceForElement(effectiveType);
+                yield mapNode(rootSource, value, instance, value.getClass(), effectiveType);
+            }
+
+            case COLLECTION -> {
+                Collection<Object> col = createCollectionFromType(effectiveType);
+                mapCollection(rootSource, value, col, null);
+                yield col;
+            }
+
+            case MAP -> {
+                Map<Object, Object> nested = new ConcurrentHashMap<>();
+                mapMap(value, nested, null, null);
+                yield nested;
+            }
+        };
+    }
+
+    private Object coerceMapKey(Object key, Class<?> targetKeyType) {
+        if (key == null || targetKeyType == null || targetKeyType.isInstance(key)) return key;
+
+        String raw = key.toString();
+        try {
+            if (targetKeyType == Integer.class || targetKeyType == int.class)    return Integer.parseInt(raw);
+            if (targetKeyType == Long.class    || targetKeyType == long.class)   return Long.parseLong(raw);
+            if (targetKeyType == Double.class  || targetKeyType == double.class) return Double.parseDouble(raw);
+        } catch (NumberFormatException e) {
+            throw new MappingException(
+                    "Cannot coerce map key '" + raw + "' to " + targetKeyType.getName(), e
+            );
+        }
+        return key;
+    }
+
+    private Class<?> resolveMapGenericType(Field field, int argIndex) {
+        Type generic = field.getGenericType();
+        if (generic instanceof ParameterizedType pt) {
+            Type[] args = pt.getActualTypeArguments();
+            if (args.length > argIndex) {
+                Type arg = args[argIndex];
+                if (arg instanceof Class<?> c) return c;
+                if (arg instanceof ParameterizedType nested) return (Class<?>) nested.getRawType();
+            }
+        }
+        return null;
     }
 
     private record AutoMapperClassKey(Class<?> source, Class<?> target) {}
