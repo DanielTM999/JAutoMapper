@@ -131,7 +131,11 @@ public class AutoMapperService implements AutoMapper {
 
     @Override
     public <T extends Collection<?>> T map(Object source, CollectionReference<T> collectionReferenceType) throws MappingException {
-        Type targetType = collectionReferenceType.getType();
+        return map(source, collectionReferenceType.getType());
+    }
+
+    @Override
+    public <T extends Collection<?>> T map(Object source, Type targetType) throws MappingException {
         Class<?> targetClass;
         if (targetType instanceof ParameterizedType paramType) {
             Type rawType = paramType.getRawType();
@@ -146,7 +150,7 @@ public class AutoMapperService implements AutoMapper {
             throw new MappingException("invalid target type");
         }
 
-        Class<?> targetTypeGeneric = getFirstParameterizedType(collectionReferenceType.getType(), collectionReferenceType.getClass().getName());
+        Class<?> targetTypeGeneric = getFirstParameterizedType(targetType, targetClass.getName());
 
         validTargetType(targetClass);
         validSource(source);
@@ -161,7 +165,6 @@ public class AutoMapperService implements AutoMapper {
 
         return (T)target;
     }
-
 
     private void validTargetType(Class<?> targetType) {
         if (targetType == null) {
