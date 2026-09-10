@@ -8,6 +8,14 @@
     <artifactId>JAutoMapper</artifactId>
     <version>1.0.0</version>
 
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://raw.githubusercontent.com/DanielTM999/JAutoMapper/main/LICENSE</url>
+            <distribution>repo</distribution>
+        </license>
+    </licenses>
+
     <properties>
         <maven.compiler.source>21</maven.compiler.source>
         <maven.compiler.target>21</maven.compiler.target>
