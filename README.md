@@ -76,6 +76,7 @@ Campos com o mesmo nome na origem e no destino são copiados automaticamente, se
 - **Perfil (`MappingProfile`):** a configuração de um par origem → destino.
 - **Perfil interno (`nested`):** a configuração de um par de classes que aparece *dentro* do destino (elemento de lista, campo objeto etc.).
 - **Acesso por campo:** a lib lê e escreve os **campos** diretamente por reflexão, inclusive os `private` e os herdados de superclasses. Getters e setters **não** são usados. Por isso, todos os nomes nas strings são **nomes de campo Java**, com diferença entre maiúsculas e minúsculas.
+- **Campos ignorados sempre:** campos `static` (como `serialVersionUID` e constantes) e campos sintéticos gerados pelo compilador (como `this$0`) nunca são lidos nem gravados. Também não entram nos `Map` gerados a partir de objetos e não contam como candidatos do `autoBackReference`.
 
 ---
 

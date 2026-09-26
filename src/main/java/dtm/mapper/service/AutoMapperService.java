@@ -337,7 +337,6 @@ public class AutoMapperService implements AutoMapper {
         }
         Field found = null;
         for (Field field : getFieldsForClass(childType)) {
-            if (Modifier.isStatic(field.getModifiers())) continue;
             Class<?> fieldType = field.getType();
             if (resolveKind(fieldType) != NodeKind.OBJECT) continue;
             if (!fieldType.isAssignableFrom(ownerType)) continue;
@@ -979,6 +978,7 @@ public class AutoMapperService implements AutoMapper {
 
             while (current != null && current != Object.class) {
                 for (Field field : current.getDeclaredFields()) {
+                    if (Modifier.isStatic(field.getModifiers()) || field.isSynthetic()) continue;
                     field.setAccessible(true);
                     fields.add(field);
                 }

@@ -676,6 +676,72 @@ public class AutoMapperFeaturesTest {
         assertEquals(new BigDecimal("1.5"), target.get(0).valor);
     }
 
+    public static class Registro {
+        String nome;
+    }
+
+    public static class RegistroEntidade {
+        private static final long serialVersionUID = 1L;
+        static int contador = 5;
+        String nome;
+    }
+
+    public static class RegistroComStatic {
+        static final String VERSAO = "v1";
+        String nome;
+    }
+
+    @Test
+    void shouldIgnoreStaticFieldsOfTargetWithFailPolicy() {
+        AutoMapper mapper = AutoMapperService.register(Registro.class, RegistroEntidade.class);
+
+        Registro source = new Registro();
+        source.nome = "Ana";
+
+        RegistroEntidade target = assertDoesNotThrow(() -> mapper.map(source, RegistroEntidade.class));
+
+        assertEquals("Ana", target.nome);
+        assertEquals(5, RegistroEntidade.contador);
+    }
+
+    @Test
+    void shouldIgnoreStaticFieldsOfTargetWithDefaultPolicy() {
+        AutoMapper mapper = AutoMapperService.register(
+                Registro.class,
+                RegistroEntidade.class,
+                profile -> profile
+                        .missingFieldPolicy(MissingFieldPolicy.DEFAULT)
+                        .nullValuePolicy(NullValuePolicy.SET_DEFAULT)
+        );
+
+        RegistroEntidade target = assertDoesNotThrow(() -> mapper.map(new Registro(), RegistroEntidade.class));
+
+        assertNull(target.nome);
+        assertEquals(5, RegistroEntidade.contador);
+    }
+
+    public static class MapHolderSource {
+        RegistroComStatic registro;
+    }
+
+    public static class MapHolder {
+        Map<String, Object> registro;
+    }
+
+    @Test
+    void shouldNotCopyStaticFieldsWhenMappingObjectToMap() {
+        AutoMapper mapper = AutoMapperService.register(MapHolderSource.class, MapHolder.class);
+
+        MapHolderSource source = new MapHolderSource();
+        source.registro = new RegistroComStatic();
+        source.registro.nome = "Ana";
+
+        MapHolder target = mapper.map(source, MapHolder.class);
+
+        assertEquals("Ana", target.registro.get("nome"));
+        assertFalse(target.registro.containsKey("VERSAO"));
+    }
+
     @Test
     void shouldPickFirstMatchingElement() {
         MapperConverter<Object, String> firstB = Converters.firstMatch((String s) -> s.startsWith("b"));
