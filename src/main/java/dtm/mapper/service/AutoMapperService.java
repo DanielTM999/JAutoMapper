@@ -5,31 +5,33 @@ import dtm.mapper.AutoMapper;
 import dtm.mapper.CollectionReference;
 import dtm.mapper.MapperConverter;
 import dtm.mapper.MappingProfile;
+import dtm.mapper.enums.ConversionFailurePolicy;
+import dtm.mapper.enums.NestedScope;
 import dtm.mapper.enums.NodeKind;
 import dtm.mapper.exceptions.MappingException;
+import dtm.mapper.imple.ClassPairKey;
 import dtm.mapper.imple.DefaultMappingProfile;
+import dtm.mapper.imple.DefaultMappingProfile.NestedDeclaration;
+import dtm.mapper.imple.TypeConverter;
 
 import java.lang.reflect.*;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Supplier;
 
 public class AutoMapperService implements AutoMapper {
 
     private static final Object MISSING = new Object();
-    private static final Map<AutoMapperClassKey, AutoMapperService> MAPPERS = new ConcurrentHashMap<>();
+    private static final Map<ClassPairKey, AutoMapperService> MAPPERS = new ConcurrentHashMap<>();
     private static final Map<Class<?>, List<Field>> CLASS_FIELD_CACHE = new ConcurrentHashMap<>();
+    private static final Map<ClassPairKey, GlobalEntry> GLOBAL_PROFILES = new ConcurrentHashMap<>();
+    private static final Map<ClassPairKey, Optional<Field>> AUTO_BACK_REFERENCES = new ConcurrentHashMap<>();
+    private static final String ROOT_PATH_PREFIX = "$.";
 
     private final DefaultMappingProfile mappingProfile;
-    private final AtomicBoolean ignoredFieldsLoaded;
-    private final AtomicBoolean customMatterFieldsLoaded;
-    private final AtomicBoolean converterFieldsLoaded;
-
-    private final Set<Field> ignoredFields;
-    private final Map<Field, String> customMapperFields;
-    private final Map<Field, MapperConverter<?, ?>> converterFields;
+    private final Map<ResolvedKey, ResolvedProfile> resolvedProfiles;
 
     public static AutoMapper register(Class<?> source, Class<?> target) {
         return register(source, target, null);
@@ -44,13 +46,7 @@ public class AutoMapperService implements AutoMapper {
             throw new MappingException("Target type cannot be null");
         }
 
-        DefaultMappingProfile mappingProfile = new DefaultMappingProfile(target, source);
-
-        if(mappingProfileConsumer != null) {
-            mappingProfileConsumer.accept(mappingProfile);
-        }
-
-        return new AutoMapperService(mappingProfile);
+        return createService(source, target, mappingProfileConsumer);
     }
 
     public static AutoMapper getAutoMapper(Class<?> source, Class<?> target) {
@@ -62,7 +58,7 @@ public class AutoMapperService implements AutoMapper {
             throw new MappingException("Target type cannot be null");
         }
 
-        AutoMapperClassKey key = new AutoMapperClassKey(source, target);
+        ClassPairKey key = new ClassPairKey(source, target);
         AutoMapperService autoMapperService = MAPPERS.get(key);
         if (autoMapperService == null) {
             throw new MappingException(
@@ -88,28 +84,27 @@ public class AutoMapperService implements AutoMapper {
             throw new MappingException("Target type cannot be null");
         }
 
-        AutoMapperClassKey key = new AutoMapperClassKey(source, target);
+        ClassPairKey key = new ClassPairKey(source, target);
 
-        return MAPPERS.computeIfAbsent(key, k -> {
-            DefaultMappingProfile mappingProfile = new DefaultMappingProfile(target, source);
+        return MAPPERS.computeIfAbsent(key, k -> createService(source, target, mappingProfileConsumer));
+    }
 
-            if (mappingProfileConsumer != null) {
-                mappingProfileConsumer.accept(mappingProfile);
-            }
+    private static AutoMapperService createService(Class<?> source, Class<?> target, Consumer<MappingProfile> mappingProfileConsumer) {
+        DefaultMappingProfile mappingProfile = new DefaultMappingProfile(target, source);
 
-            return new AutoMapperService(mappingProfile);
-        });
+        if (mappingProfileConsumer != null) {
+            mappingProfileConsumer.accept(mappingProfile);
+        }
+
+        publishGlobalProfiles(mappingProfile, new ClassPairKey(source, target));
+
+        return new AutoMapperService(mappingProfile);
     }
 
 
     protected AutoMapperService(DefaultMappingProfile mappingProfile) {
         this.mappingProfile = mappingProfile;
-        this.ignoredFieldsLoaded = new AtomicBoolean(false);
-        this.customMatterFieldsLoaded =  new AtomicBoolean(false);
-        this.converterFieldsLoaded = new AtomicBoolean(false);
-        this.ignoredFields = new HashSet<>();
-        this.customMapperFields = new HashMap<>();
-        this.converterFields = new HashMap<>();
+        this.resolvedProfiles = new ConcurrentHashMap<>();
     }
 
 
@@ -118,13 +113,13 @@ public class AutoMapperService implements AutoMapper {
         validTargetType(targetType);
         validSource(source);
 
-        if(ignoredFieldsLoaded.compareAndSet(false, true)) searchIgnorableFields(targetType);
-        if(customMatterFieldsLoaded.compareAndSet(false, true)) searchCustomMapperFields(targetType);
-        if(converterFieldsLoaded.compareAndSet(false, true)) searchConvertersFields(targetType);
+        MappingContext context = MappingContext.root(resolve(mappingProfile, targetType), source);
 
         T target = createInstanceForElement(targetType);
 
-        mapNode(source, source, target, source.getClass(), targetType);
+        mapNode(context, source, target, source.getClass(), targetType);
+
+        runAfterMap(context, source, target);
 
         return target;
     }
@@ -155,13 +150,11 @@ public class AutoMapperService implements AutoMapper {
         validTargetType(targetClass);
         validSource(source);
 
-        if(ignoredFieldsLoaded.compareAndSet(false, true)) searchIgnorableFields(targetTypeGeneric);
-        if(customMatterFieldsLoaded.compareAndSet(false, true)) searchCustomMapperFields(targetTypeGeneric);
-        if(converterFieldsLoaded.compareAndSet(false, true)) searchConvertersFields(targetTypeGeneric);
+        MappingContext context = MappingContext.root(resolve(mappingProfile, targetTypeGeneric), source);
 
         Collection<?> target = createCollectionFromType(targetClass);
 
-        mapNode(source, source, target, source.getClass(), targetClass, targetTypeGeneric);
+        mapNode(context, source, target, source.getClass(), targetClass, targetTypeGeneric);
 
         return (T)target;
     }
@@ -247,140 +240,211 @@ public class AutoMapperService implements AutoMapper {
     }
 
 
+    private static void publishGlobalProfiles(DefaultMappingProfile rootProfile, ClassPairKey owner) {
+        Map<ClassPairKey, DefaultMappingProfile> globals = new LinkedHashMap<>();
+        collectGlobalProfiles(rootProfile, globals);
+        if (globals.isEmpty()) return;
 
-    private void searchIgnorableFields(Class<?> target) {
-        Set<String> ignoredFieldsStr = mappingProfile.getIgnoredFields();
-
-        for(String ignoredField : ignoredFieldsStr) {
-            searchIgnorableFieldByName(ignoredField, target);
+        synchronized (GLOBAL_PROFILES) {
+            for (ClassPairKey key : globals.keySet()) {
+                GlobalEntry existing = GLOBAL_PROFILES.get(key);
+                if (existing != null && !existing.owner().equals(owner)) {
+                    throw new MappingException(
+                            "Global nested profile already registered for " + key.describe()
+                                    + " by " + existing.owner().describe()
+                    );
+                }
+            }
+            globals.forEach((key, profile) -> GLOBAL_PROFILES.put(key, new GlobalEntry(profile, owner)));
         }
-
     }
 
-    private void searchIgnorableFieldByName(String fieldNameRaw, Class<?> target) {
-        String[] parts = fieldNameRaw.split("\\.");
-
-        Class<?> currentType = target;
-        Field field = null;
-
-        StringBuilder resolvedPath = new StringBuilder(target.getName());
-        Iterator<String> iter = Arrays.asList(parts).iterator();
-
-        while (iter.hasNext()) {
-            String part = iter.next();
-            field = findFieldInHierarchy(currentType, part);
-            if (field == null) {
-                throw new MappingException(
-                        "Ignored field not found: '" + part +
-                                "' while resolving path '" + fieldNameRaw +
-                                "' starting from type " + resolvedPath
-                );
+    private static void collectGlobalProfiles(DefaultMappingProfile profile, Map<ClassPairKey, DefaultMappingProfile> globals) {
+        for (Map.Entry<ClassPairKey, NestedDeclaration> entry : profile.getNestedDeclarations().entrySet()) {
+            NestedDeclaration declaration = entry.getValue();
+            if (profile.effectiveScope(declaration) == NestedScope.GLOBAL) {
+                globals.put(entry.getKey(), declaration.profile());
             }
+            collectGlobalProfiles(declaration.profile(), globals);
+        }
+    }
 
-            field.setAccessible(true);
+    private static DefaultMappingProfile findGlobalProfile(Class<?> source, Class<?> target) {
+        GlobalEntry exact = GLOBAL_PROFILES.get(new ClassPairKey(source, target));
+        if (exact != null) {
+            return exact.profile();
+        }
+        for (Map.Entry<ClassPairKey, GlobalEntry> entry : GLOBAL_PROFILES.entrySet()) {
+            ClassPairKey key = entry.getKey();
+            if (key.target().equals(target) && key.source().isAssignableFrom(source)) {
+                return entry.getValue().profile();
+            }
+        }
+        return null;
+    }
+
+    private ResolvedProfile resolve(DefaultMappingProfile profile, Class<?> targetType) {
+        return resolvedProfiles.computeIfAbsent(
+                new ResolvedKey(profile, targetType),
+                key -> new ResolvedProfile(profile, targetType)
+        );
+    }
+
+    private MappingContext childContext(MappingContext parentContext, Object source, Class<?> targetType, Field skipField) {
+        if (resolveKind(targetType) == NodeKind.OBJECT) {
+            Class<?> sourceType = source.getClass();
+            DefaultMappingProfile nestedProfile = parentContext.resolved().profile().findNested(sourceType, targetType);
+            if (nestedProfile == null) {
+                nestedProfile = findGlobalProfile(sourceType, targetType);
+            }
+            if (nestedProfile != null) {
+                return new MappingContext(resolve(nestedProfile, targetType), parentContext.rootSource(), source, skipField, true);
+            }
+        }
+        return new MappingContext(parentContext.resolved(), parentContext.rootSource(), parentContext.pathRoot(), skipField, false);
+    }
+
+    private Object mapChild(MappingContext parentContext, Object source, Object target, Class<?> targetType, Field skipField) {
+        MappingContext context = childContext(parentContext, source, targetType, skipField);
+        Object mapped = mapNode(context, source, target, source.getClass(), targetType);
+        if (context.nested()) {
+            runAfterMap(context, source, mapped);
+        }
+        return mapped;
+    }
+
+    private void applyBackReference(Field childField, Object child, Object owner) throws IllegalAccessException {
+        if (child == null || childField == null) return;
+        childField.set(child, owner);
+    }
+
+    private Field backReferenceField(MappingContext context, Field ownerField, Class<?> childType, Class<?> ownerType) {
+        Field explicit = context.resolved().backReferenceFields().get(ownerField);
+        if (explicit != null) {
+            return explicit;
+        }
+        if (!context.resolved().profile().isAutoBackReference()) {
+            return null;
+        }
+        return AUTO_BACK_REFERENCES
+                .computeIfAbsent(new ClassPairKey(childType, ownerType), key -> findAutoBackReference(childType, ownerType))
+                .orElse(null);
+    }
+
+    private Optional<Field> findAutoBackReference(Class<?> childType, Class<?> ownerType) {
+        if (resolveKind(childType) != NodeKind.OBJECT) {
+            return Optional.empty();
+        }
+        Field found = null;
+        for (Field field : getFieldsForClass(childType)) {
+            if (Modifier.isStatic(field.getModifiers())) continue;
             Class<?> fieldType = field.getType();
-
-            if (iter.hasNext()) {
-                validateNavigableField(field, fieldType);
+            if (resolveKind(fieldType) != NodeKind.OBJECT) continue;
+            if (!fieldType.isAssignableFrom(ownerType)) continue;
+            if (found != null) {
+                return Optional.empty();
             }
+            found = field;
+        }
+        return Optional.ofNullable(found);
+    }
 
-            resolvedPath.append(".").append(part);
-            currentType = fieldType;
+    private Object convertValue(MappingContext context, Object value, Class<?> targetType, String element) {
+        if (value == null || TypeConverter.isCompatible(value, targetType)) {
+            return value;
         }
 
-        this.ignoredFields.add(field);
-    }
+        DefaultMappingProfile profile = context.resolved().profile();
+        Class<?> wrappedTarget = TypeConverter.wrap(targetType);
 
-
-    private void searchCustomMapperFields(Class<?> target) {
-        Map<String, String> ignoredFieldsStr = mappingProfile.getMappings();
-
-        ignoredFieldsStr.forEach((k, v) -> {
-            searchCustomMapperFieldByName(k, v, target);
-        });
-    }
-
-    private void searchCustomMapperFieldByName(String fieldNameRaw, String newFieldNameRaw, Class<?> target) {
-        String[] parts = fieldNameRaw.split("\\.");
-
-        Class<?> currentType = target;
-        Field field = null;
-
-        StringBuilder resolvedPath = new StringBuilder(target.getName());
-        Iterator<String> iter = Arrays.asList(parts).iterator();
-
-        while (iter.hasNext()) {
-            String part = iter.next();
-            field = findFieldInHierarchy(currentType, part);
-            if (field == null) {
-                throw new MappingException(
-                        "Ignored field not found: '" + part +
-                                "' while resolving path '" + fieldNameRaw +
-                                "' starting from type " + resolvedPath
-                );
+        try {
+            @SuppressWarnings("unchecked")
+            MapperConverter<Object, Object> converter = (MapperConverter<Object, Object>) profile.findTypeConverter(value.getClass(), wrappedTarget);
+            if (converter != null) {
+                return converter.convert(value);
             }
-
-            field.setAccessible(true);
-            Class<?> fieldType = field.getType();
-
-            if (iter.hasNext()) {
-                validateNavigableField(field, fieldType);
+            if (resolveKind(targetType) != NodeKind.VALUE || targetType.isEnum()) {
+                return value;
             }
-
-            resolvedPath.append(".").append(part);
-            currentType = fieldType;
+            Object converted = TypeConverter.convert(value, targetType, profile.getDatePatterns());
+            if (converted != TypeConverter.UNSUPPORTED) {
+                return converted;
+            }
+            return conversionFailure(context, value, targetType, element, null);
+        } catch (MappingException e) {
+            throw e;
+        } catch (Exception e) {
+            return conversionFailure(context, value, targetType, element, e);
         }
-
-        this.customMapperFields.put(field, newFieldNameRaw);
     }
 
-
-    private void searchConvertersFields(Class<?> target) {
-        Map<String, MapperConverter<?, ?>> fieldConverters = mappingProfile.getFieldConverters();
-
-        fieldConverters.forEach((s, converter) -> {
-            searchConverterFieldByName(s, target, converter);
-        });
-
-    }
-
-    private void searchConverterFieldByName(String fieldNameRaw, Class<?> target, MapperConverter<?, ?> converter) {
-        String[] parts = fieldNameRaw.split("\\.");
-
-        Class<?> currentType = target;
-        Field field = null;
-
-        StringBuilder resolvedPath = new StringBuilder(target.getName());
-        Iterator<String> iter = Arrays.asList(parts).iterator();
-
-        while (iter.hasNext()) {
-            String part = iter.next();
-            field = findFieldInHierarchy(currentType, part);
-            if (field == null) {
-                throw new MappingException(
-                        "Ignored field not found: '" + part +
-                                "' while resolving path '" + fieldNameRaw +
-                                "' starting from type " + resolvedPath
-                );
-            }
-
-            field.setAccessible(true);
-            Class<?> fieldType = field.getType();
-
-            if (iter.hasNext()) {
-                validateNavigableField(field, fieldType);
-            }
-
-            resolvedPath.append(".").append(part);
-            currentType = fieldType;
+    private Object conversionFailure(MappingContext context, Object value, Class<?> targetType, String element, Exception cause) {
+        if (context.resolved().profile().getConversionFailurePolicy() == ConversionFailurePolicy.SET_NULL) {
+            return null;
         }
+        throw new MappingException(
+                "Cannot convert value of type " + value.getClass().getName()
+                        + " to " + targetType.getName()
+                        + " for '" + element + "'",
+                cause
+        );
+    }
 
-        this.converterFields.put(field, converter);
+    private Object resolveFromFlatten(MappingContext context, Object source, Field targetField) throws IllegalAccessException, NoSuchFieldException {
+        if (source != context.pathRoot()) {
+            return MISSING;
+        }
+        for (String path : context.resolved().profile().getFlattenPaths()) {
+            Object holder = resolveSourceValueByPath(context, path);
+            if (holder == null) continue;
+            Object value = resolveSourceValue(holder, resolveKind(holder.getClass()), targetField);
+            if (value != MISSING) {
+                return value;
+            }
+        }
+        return MISSING;
+    }
+
+    private Object emptyValueFor(Class<?> type) {
+        if (type.isPrimitive()) {
+            if (type == int.class) return 0;
+            if (type == long.class) return 0L;
+            if (type == boolean.class) return false;
+            if (type == double.class) return 0d;
+            if (type == float.class) return 0f;
+            if (type == short.class) return (short) 0;
+            if (type == byte.class) return (byte) 0;
+            if (type == char.class) return '\0';
+        }
+        if (type.isArray()) {
+            return Array.newInstance(type.getComponentType(), 0);
+        }
+        if (Collection.class.isAssignableFrom(type)) {
+            return createCollectionFromType(type);
+        }
+        if (Map.class.isAssignableFrom(type)) {
+            if (type.isInterface() || Modifier.isAbstract(type.getModifiers())) {
+                return new LinkedHashMap<>();
+            }
+            return createInstanceForElement(type);
+        }
+        return null;
+    }
+
+    private void runAfterMap(MappingContext context, Object source, Object target) {
+        for (BiConsumer<Object, Object> action : context.resolved().profile().getAfterMapActions()) {
+            try {
+                action.accept(source, target);
+            } catch (MappingException e) {
+                throw e;
+            } catch (Exception e) {
+                throw new MappingException("Error in afterMap action", e);
+            }
+        }
     }
 
 
-
-    private Field findFieldInHierarchy(Class<?> type, String fieldName) {
+    private static Field findFieldInHierarchy(Class<?> type, String fieldName) {
         if (type == null) {
             return null;
         }
@@ -407,7 +471,7 @@ public class AutoMapperService implements AutoMapper {
         return null;
     }
 
-    private void validateNavigableField(Field field, Class<?> fieldType) {
+    private static void validateNavigableField(Field field, Class<?> fieldType) {
 
         if (fieldType.isPrimitive()) {
             throw new MappingException(
@@ -428,17 +492,17 @@ public class AutoMapperService implements AutoMapper {
 
 
     private Object mapNode(
-            Object rootSource,
+            MappingContext context,
             Object sourceNode,
             Object targetNode,
             Class<?> sourceType,
             Class<?> targetType
     ){
-        return mapNode(rootSource, sourceNode, targetNode, sourceType, targetType, null);
+        return mapNode(context, sourceNode, targetNode, sourceType, targetType, null);
     }
 
     private Object mapNode(
-            Object rootSource,
+            MappingContext context,
             Object sourceNode,
             Object targetNode,
             Class<?> sourceType,
@@ -448,40 +512,49 @@ public class AutoMapperService implements AutoMapper {
         NodeKind kind = resolveKind(targetType);
 
         switch (kind) {
-            case OBJECT -> mapObject(rootSource, sourceNode, targetNode);
-            case MAP -> mapMap(rootSource, sourceNode);
-            case COLLECTION -> mapCollection(rootSource, sourceNode, targetNode, targetTypeGeneric);
+            case OBJECT -> mapObject(context, sourceNode, targetNode);
+            case MAP -> mapMap(context, sourceNode, targetNode);
+            case COLLECTION -> mapCollection(context, sourceNode, targetNode, targetTypeGeneric);
             case VALUE -> targetNode = assignValue(sourceNode, targetNode);
         }
         return targetNode;
     }
 
-    private void mapObject(Object rootSource, Object source, Object target) {
+    private void mapObject(MappingContext context, Object source, Object target) {
         NodeKind sourceKind = resolveKind(source.getClass());
+        ResolvedProfile resolved = context.resolved();
 
         List<Field> targetFields = getFieldsForClass(target.getClass());
 
         for (Field targetField : targetFields) {
-            if(ignoredFields.contains(targetField)) continue;
+            if(resolved.ignoredFields().contains(targetField)) continue;
+            if(targetField.equals(context.skipField())) continue;
             try {
                 Object sourceValue;
-                if(customMapperFields.containsKey(targetField)) {
-                    sourceValue = resolveSourceValueByPath(rootSource, customMapperFields.get(targetField));
+                if(resolved.customMapperFields().containsKey(targetField)) {
+                    sourceValue = resolveSourceValueByPath(context, resolved.customMapperFields().get(targetField));
                 }else{
                     sourceValue = resolveSourceValue(source, sourceKind, targetField);
+                    if (sourceValue == MISSING) {
+                        sourceValue = resolveFromFlatten(context, source, targetField);
+                    }
                 }
 
                 if (sourceValue == MISSING) {
-                    sourceValue = handleMissingFieldPolicy(targetField);
+                    sourceValue = handleMissingFieldPolicy(context, targetField);
                 }
                 if (sourceValue == MISSING) continue;
-                sourceValue = handleNullValuePolicy(sourceValue, targetField);
-                if(converterFields.containsKey(targetField)) {
+                sourceValue = handleNullValuePolicy(context, sourceValue, targetField);
+                if(resolved.converterFields().containsKey(targetField)) {
                     @SuppressWarnings("unchecked")
-                    MapperConverter<Object, Object> converter = (MapperConverter<Object, Object>) converterFields.get(targetField);
+                    MapperConverter<Object, Object> converter = (MapperConverter<Object, Object>) resolved.converterFields().get(targetField);
                     sourceValue = converter.convert(sourceValue);
                 }
-                assignResolvedValue(rootSource, sourceValue, target, targetField);
+                sourceValue = convertValue(context, sourceValue, targetField.getType(), targetField.getName());
+                if (sourceValue == null) {
+                    sourceValue = handleNullValuePolicy(context, null, targetField);
+                }
+                assignResolvedValue(context, sourceValue, target, targetField);
             }catch (Exception e) {
                 throw new MappingException(
                         "Error mapping field: " + targetField.getName(),
@@ -491,11 +564,11 @@ public class AutoMapperService implements AutoMapper {
         }
     }
 
-    private void mapMap(Object source, Object target) {
-        mapMap(source, target, null, null);
+    private void mapMap(MappingContext context, Object source, Object target) {
+        mapMap(context, source, target, null, null);
     }
 
-    private void mapMap(Object source, Object target, Class<?> targetKeyType, Class<?> targetValueType) {
+    private void mapMap(MappingContext context, Object source, Object target, Class<?> targetKeyType, Class<?> targetValueType) {
         if (source == null || target == null) return;
         if(!(target instanceof Map)) return;
 
@@ -504,7 +577,7 @@ public class AutoMapperService implements AutoMapper {
         if (source instanceof Map<?, ?> sourceMap) {
             for (Map.Entry<?, ?> entry : sourceMap.entrySet()) {
                 Object key = coerceMapKey(entry.getKey(), targetKeyType);
-                Object value = mapMapValue(source, entry.getValue(), targetValueType);
+                Object value = mapMapValue(context, entry.getValue(), targetValueType);
                 targetMap.put(key, value);
             }
         }else{
@@ -513,7 +586,7 @@ public class AutoMapperService implements AutoMapper {
                 try {
                     field.setAccessible(true);
                     Object raw   = field.get(source);
-                    Object value = mapMapValue(source, raw, targetValueType);
+                    Object value = mapMapValue(context, raw, targetValueType);
                     targetMap.put(field.getName(), value);
                 } catch (IllegalAccessException e) {
                     throw new MappingException(
@@ -524,18 +597,18 @@ public class AutoMapperService implements AutoMapper {
         }
     }
 
-    private void mapCollection(Object rootSource, Object source, Object target, Class<?> targetGenericType) {
+    private void mapCollection(MappingContext context, Object source, Object target, Class<?> targetGenericType) {
         if (source == null) return;
         Class<?> sourceClass = source.getClass();
         Class<?> targetType = target.getClass();
 
         try{
             if(sourceClass.isArray()){
-                assignArraySourceValueRoot(rootSource, source, target, targetGenericType);
+                assignArraySourceValueRoot(context, source, target, targetGenericType);
             }else if(Collection.class.isAssignableFrom(sourceClass)){
-                assignCollectionSourceValueRoot(rootSource, source, target, targetGenericType);
+                assignCollectionSourceValueRoot(context, source, target, targetGenericType);
             }else if(source instanceof Map<?,?> map){
-                assignCollectionSourceValueRoot(rootSource, map.values(), target, targetGenericType);
+                assignCollectionSourceValueRoot(context, map.values(), target, targetGenericType);
             }
         }catch (Exception e) {
             throw new MappingException(
@@ -569,21 +642,23 @@ public class AutoMapperService implements AutoMapper {
         return null;
     }
 
-    private Object handleNullValuePolicy(Object sourceValue, Field targetField) {
+    private Object handleNullValuePolicy(MappingContext context, Object sourceValue, Field targetField) {
 
         if (sourceValue != null) {
             return sourceValue;
         }
 
-        return switch (mappingProfile.getNullValuePolicy()) {
+        DefaultMappingProfile profile = context.resolved().profile();
+
+        return switch (profile.getNullValuePolicy()) {
             case IGNORE -> null;
             case SET_DEFAULT -> {
                 Supplier<?> defaultSupplier =
-                        mappingProfile.getFieldDefault(targetField.getName()) != null
-                                ? mappingProfile.getFieldDefault(targetField.getName())
-                                : mappingProfile.getTypeDefault(targetField.getType());
+                        profile.getFieldDefault(targetField.getName()) != null
+                                ? profile.getFieldDefault(targetField.getName())
+                                : profile.getTypeDefault(targetField.getType());
 
-                yield defaultSupplier != null ? defaultSupplier.get() : null;
+                yield defaultSupplier != null ? defaultSupplier.get() : emptyValueFor(targetField.getType());
             }
             case FAIL -> throw new MappingException(
                     "Null value encountered for field '"
@@ -594,33 +669,23 @@ public class AutoMapperService implements AutoMapper {
         };
     }
 
-    private Object handleMissingFieldPolicy(Field targetField) {
+    private Object handleMissingFieldPolicy(MappingContext context, Field targetField) {
 
-        return switch (mappingProfile.getMissingFieldPolicy()) {
+        DefaultMappingProfile profile = context.resolved().profile();
+
+        return switch (profile.getMissingFieldPolicy()) {
             case IGNORE -> MISSING;
 
             case DEFAULT -> {
-                Supplier<?> supplier = mappingProfile.getFieldDefault(targetField.getName()) != null
-                                ? mappingProfile.getFieldDefault(targetField.getName())
-                                : mappingProfile.getTypeDefault(targetField.getType());
+                Supplier<?> supplier = profile.getFieldDefault(targetField.getName()) != null
+                                ? profile.getFieldDefault(targetField.getName())
+                                : profile.getTypeDefault(targetField.getType());
 
                 if(supplier != null){
                     yield supplier.get();
                 }
 
-                Class<?> type = targetField.getType();
-                if(type.isPrimitive()){
-                    if (type == int.class) yield 0;
-                    if (type == long.class) yield 0L;
-                    if (type == boolean.class) yield false;
-                    if (type == double.class) yield 0d;
-                    if (type == float.class) yield 0f;
-                    if (type == short.class) yield (short) 0;
-                    if (type == byte.class) yield (byte) 0;
-                    if (type == char.class) yield '\0';
-                }
-                yield null;
-
+                yield emptyValueFor(targetField.getType());
             }
 
             case FAIL -> throw new MappingException(
@@ -631,7 +696,7 @@ public class AutoMapperService implements AutoMapper {
         };
     }
 
-    private void assignResolvedValue(Object rootSource, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
+    private void assignResolvedValue(MappingContext context, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
         Class<?> fieldType = targetField.getType();
         NodeKind targetKind = resolveKind(fieldType);
 
@@ -689,13 +754,9 @@ public class AutoMapperService implements AutoMapper {
                     targetField.set(target, targetValue);
                 }
 
-                mapNode(
-                        rootSource,
-                        sourceValue,
-                        targetValue,
-                        sourceValue.getClass(),
-                        targetField.getType()
-                );
+                Field childField = backReferenceField(context, targetField, targetField.getType(), target.getClass());
+                mapChild(context, sourceValue, targetValue, targetField.getType(), childField);
+                applyBackReference(childField, targetValue, target);
             }
 
             case MAP -> {
@@ -711,25 +772,25 @@ public class AutoMapperService implements AutoMapper {
                 Class<?> keyType   = resolveMapGenericType(targetField, 0);
                 Class<?> valueType = resolveMapGenericType(targetField, 1);
 
-                mapMap(sourceValue, targetValue, keyType, valueType);
+                mapMap(context, sourceValue, targetValue, keyType, valueType);
 
             }
 
             case COLLECTION -> {
-                assignCollectionValue(rootSource, sourceValue, target, targetField);
+                assignCollectionValue(context, sourceValue, target, targetField);
             }
         }
     }
 
 
-    private void assignCollectionValue(Object rootSource, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
+    private void assignCollectionValue(MappingContext context, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
         if (sourceValue == null) return;
         Class<?> sourceClass = sourceValue.getClass();
 
         if(sourceClass.isArray()){
-            assignArraySourceValue(rootSource, sourceValue, target, targetField);
+            assignArraySourceValue(context, sourceValue, target, targetField);
         }else if(Collection.class.isAssignableFrom(sourceClass)){
-            assignCollectionSourceValue(rootSource, sourceValue, target, targetField);
+            assignCollectionSourceValue(context, sourceValue, target, targetField);
         }else{
             throw new MappingException(
                     "Source value for field '" + targetField.getName() + "' is neither an array nor a collection. Found type: " + sourceClass.getName()
@@ -740,7 +801,7 @@ public class AutoMapperService implements AutoMapper {
 
 
 
-    private void assignArraySourceValue(Object rootSource, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
+    private void assignArraySourceValue(MappingContext context, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
         if (sourceValue == null) return;
 
         int length = Array.getLength(sourceValue);
@@ -749,10 +810,10 @@ public class AutoMapperService implements AutoMapper {
             sourceCollection.add(Array.get(sourceValue, i));
         }
 
-        assignCollectionSourceValue(rootSource, sourceCollection, target, targetField);
+        assignCollectionSourceValue(context, sourceCollection, target, targetField);
     }
 
-    private void assignCollectionSourceValue(Object rootSource, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
+    private void assignCollectionSourceValue(MappingContext context, Object sourceValue, Object target, Field targetField) throws IllegalAccessException {
         if (!(sourceValue instanceof Collection<?> sourceCollection)) return;
 
         Class<?> targetType = targetField.getType();
@@ -761,6 +822,7 @@ public class AutoMapperService implements AutoMapper {
                 : getFirstParameterizedType(targetField);
 
         NodeKind sourceElementKind = resolveKind(targetComponentType);
+        Field childField = backReferenceField(context, targetField, targetComponentType, target.getClass());
 
 
         if (targetType.isArray()) {
@@ -768,7 +830,9 @@ public class AutoMapperService implements AutoMapper {
             int i = 0;
             for (Object elem : sourceCollection) {
                 if (elem != null) {
-                    Object mappedElem = mapCollectionElement(rootSource, elem, sourceElementKind, targetComponentType);
+                    Object mappedElem = mapCollectionElement(context, elem, sourceElementKind, targetComponentType, childField);
+                    if (mappedElem == null) continue;
+                    applyBackReference(childField, mappedElem, target);
                     Array.set(targetArray, i++, mappedElem);
                 }
             }
@@ -780,7 +844,9 @@ public class AutoMapperService implements AutoMapper {
             Collection<Object> targetCollection = createCollectionFromType(targetType);
             for (Object elem : sourceCollection) {
                 if (elem != null) {
-                    Object mappedElem = mapCollectionElement(rootSource, elem, sourceElementKind, targetComponentType);
+                    Object mappedElem = mapCollectionElement(context, elem, sourceElementKind, targetComponentType, childField);
+                    if (mappedElem == null) continue;
+                    applyBackReference(childField, mappedElem, target);
                     targetCollection.add(mappedElem);
                 }
             }
@@ -793,7 +859,7 @@ public class AutoMapperService implements AutoMapper {
 
 
 
-    private void assignArraySourceValueRoot(Object rootSource, Object sourceValue, Object target, Class<?> targetComponentType){
+    private void assignArraySourceValueRoot(MappingContext context, Object sourceValue, Object target, Class<?> targetComponentType){
         if (sourceValue == null) return;
 
         int length = Array.getLength(sourceValue);
@@ -802,10 +868,10 @@ public class AutoMapperService implements AutoMapper {
             sourceCollection.add(Array.get(sourceValue, i));
         }
 
-        assignCollectionSourceValueRoot(rootSource, sourceCollection, target, targetComponentType);
+        assignCollectionSourceValueRoot(context, sourceCollection, target, targetComponentType);
     }
 
-    private void assignCollectionSourceValueRoot(Object rootSource, Object sourceValue, Object target, Class<?> targetComponentType) {
+    private void assignCollectionSourceValueRoot(MappingContext context, Object sourceValue, Object target, Class<?> targetComponentType) {
         if (!(sourceValue instanceof Collection<?> sourceCollection)) return;
 
         Class<?> targetType = target.getClass();
@@ -815,7 +881,8 @@ public class AutoMapperService implements AutoMapper {
             int i = 0;
             for (Object elem : sourceCollection) {
                 if (elem != null) {
-                    Object mappedElem = mapCollectionElement(rootSource, elem, sourceElementKind, targetComponentType);
+                    Object mappedElem = mapCollectionElement(context, elem, sourceElementKind, targetComponentType, null);
+                    if (sourceElementKind != NodeKind.VALUE) runAfterMap(context, elem, mappedElem);
                     Array.set(target, i++, mappedElem);
                 }
             }
@@ -826,7 +893,9 @@ public class AutoMapperService implements AutoMapper {
             Collection<Object> targetCollection = (Collection<Object>) target;
             for (Object elem : sourceCollection) {
                 if (elem != null) {
-                    Object mappedElem = mapCollectionElement(rootSource, elem, sourceElementKind, targetComponentType);
+                    Object mappedElem = mapCollectionElement(context, elem, sourceElementKind, targetComponentType, null);
+                    if (mappedElem == null) continue;
+                    if (sourceElementKind != NodeKind.VALUE) runAfterMap(context, elem, mappedElem);
                     targetCollection.add(mappedElem);
                 }
             }
@@ -838,11 +907,13 @@ public class AutoMapperService implements AutoMapper {
 
 
 
-    private Object mapCollectionElement(Object rootSource, Object elem, NodeKind elementKind, Class<?> targetComponentType) {
-        if (elementKind == NodeKind.VALUE) return elem;
+    private Object mapCollectionElement(MappingContext context, Object elem, NodeKind elementKind, Class<?> targetComponentType, Field skipField) {
+        if (elementKind == NodeKind.VALUE) {
+            return convertValue(context, elem, targetComponentType, targetComponentType.getSimpleName() + " element");
+        }
 
         Object instanceObj = createInstanceForElement(targetComponentType);
-        return mapNode(rootSource, elem, instanceObj, elem.getClass(), targetComponentType);
+        return mapChild(context, elem, instanceObj, targetComponentType, skipField);
     }
 
 
@@ -879,7 +950,7 @@ public class AutoMapperService implements AutoMapper {
         }
     }
 
-    private NodeKind resolveKind(Class<?> type) {
+    private static NodeKind resolveKind(Class<?> type) {
 
         if (Map.class.isAssignableFrom(type)) {
             return NodeKind.MAP;
@@ -948,12 +1019,12 @@ public class AutoMapperService implements AutoMapper {
         }
     }
 
-    private Class<?> getFirstParameterizedType(Field field) {
+    private static Class<?> getFirstParameterizedType(Field field) {
         Type genericType = field.getGenericType();
         return getFirstParameterizedType(genericType, field.getName());
     }
 
-    private Class<?> getFirstParameterizedType(Type genericType, String element){
+    private static Class<?> getFirstParameterizedType(Type genericType, String element){
         if (genericType instanceof ParameterizedType parameterizedType) {
             Type[] typeArgs = parameterizedType.getActualTypeArguments();
             if (typeArgs.length > 0) {
@@ -970,6 +1041,13 @@ public class AutoMapperService implements AutoMapper {
         throw new MappingException(
                 "Cannot determine parameterized type for element: " + element
         );
+    }
+
+    private Object resolveSourceValueByPath(MappingContext context, String sourcePath) throws IllegalAccessException, NoSuchFieldException {
+        if (sourcePath.startsWith(ROOT_PATH_PREFIX)) {
+            return resolveSourceValueByPath(context.rootSource(), sourcePath.substring(ROOT_PATH_PREFIX.length()));
+        }
+        return resolveSourceValueByPath(context.pathRoot(), sourcePath);
     }
 
     private Object resolveSourceValueByPath(Object source, String sourcePath) throws IllegalAccessException, NoSuchFieldException {
@@ -1006,7 +1084,7 @@ public class AutoMapperService implements AutoMapper {
         return current;
     }
 
-    private Object mapMapValue(Object rootSource, Object value, Class<?> targetValueType) {
+    private Object mapMapValue(MappingContext context, Object value, Class<?> targetValueType) {
         if (value == null) return null;
 
         Class<?> effectiveType = (targetValueType != null) ? targetValueType : value.getClass();
@@ -1017,18 +1095,18 @@ public class AutoMapperService implements AutoMapper {
 
             case OBJECT -> {
                 Object instance = createInstanceForElement(effectiveType);
-                yield mapNode(rootSource, value, instance, value.getClass(), effectiveType);
+                yield mapChild(context, value, instance, effectiveType, null);
             }
 
             case COLLECTION -> {
                 Collection<Object> col = createCollectionFromType(effectiveType);
-                mapCollection(rootSource, value, col, null);
+                mapCollection(context, value, col, null);
                 yield col;
             }
 
             case MAP -> {
                 Map<Object, Object> nested = new ConcurrentHashMap<>();
-                mapMap(value, nested, null, null);
+                mapMap(context, value, nested, null, null);
                 yield nested;
             }
         };
@@ -1063,6 +1141,121 @@ public class AutoMapperService implements AutoMapper {
         return null;
     }
 
-    private record AutoMapperClassKey(Class<?> source, Class<?> target) {}
+    private record MappingContext(ResolvedProfile resolved, Object rootSource, Object pathRoot, Field skipField, boolean nested) {
+        static MappingContext root(ResolvedProfile resolved, Object source) {
+            return new MappingContext(resolved, source, source, null, false);
+        }
+    }
+
+    private record ResolvedKey(DefaultMappingProfile profile, Class<?> targetType) {}
+
+    private record GlobalEntry(DefaultMappingProfile profile, ClassPairKey owner) {}
+
+    private static final class ResolvedProfile {
+
+        private final DefaultMappingProfile profile;
+        private final Set<Field> ignoredFields = new HashSet<>();
+        private final Map<Field, String> customMapperFields = new HashMap<>();
+        private final Map<Field, MapperConverter<?, ?>> converterFields = new HashMap<>();
+        private final Map<Field, Field> backReferenceFields = new HashMap<>();
+
+        ResolvedProfile(DefaultMappingProfile profile, Class<?> target) {
+            this.profile = profile;
+            profile.getIgnoredFields().forEach(path -> ignoredFields.add(resolveTargetFieldPath(path, target, "Ignored field")));
+            profile.getMappings().forEach((path, sourcePath) -> customMapperFields.put(resolveTargetFieldPath(path, target, "Mapped field"), sourcePath));
+            profile.getFieldConverters().forEach((path, converter) -> converterFields.put(resolveTargetFieldPath(path, target, "Converter field"), converter));
+            profile.getBackReferences().forEach((path, childFieldName) -> resolveBackReference(path, childFieldName, target));
+        }
+
+        DefaultMappingProfile profile() {
+            return profile;
+        }
+
+        Set<Field> ignoredFields() {
+            return ignoredFields;
+        }
+
+        Map<Field, String> customMapperFields() {
+            return customMapperFields;
+        }
+
+        Map<Field, MapperConverter<?, ?>> converterFields() {
+            return converterFields;
+        }
+
+        Map<Field, Field> backReferenceFields() {
+            return backReferenceFields;
+        }
+
+        private void resolveBackReference(String ownerFieldRaw, String childFieldName, Class<?> target) {
+            Field ownerField = resolveTargetFieldPath(ownerFieldRaw, target, "Back reference field");
+            Class<?> ownerFieldType = ownerField.getType();
+
+            Class<?> childType;
+            if (ownerFieldType.isArray()) {
+                childType = ownerFieldType.getComponentType();
+            } else if (Collection.class.isAssignableFrom(ownerFieldType)) {
+                childType = getFirstParameterizedType(ownerField);
+            } else {
+                childType = ownerFieldType;
+            }
+
+            Field childField = findFieldInHierarchy(childType, childFieldName);
+            if (childField == null) {
+                throw new MappingException(
+                        "Back reference field not found: '" + childFieldName +
+                                "' in type " + childType.getName() +
+                                " (declared for '" + ownerFieldRaw + "')"
+                );
+            }
+
+            Class<?> ownerType = ownerField.getDeclaringClass();
+            if (!childField.getType().isAssignableFrom(ownerType)) {
+                throw new MappingException(
+                        "Back reference field '" + childFieldName +
+                                "' in type " + childType.getName() +
+                                " has type " + childField.getType().getName() +
+                                " which cannot hold " + ownerType.getName()
+                );
+            }
+
+            childField.setAccessible(true);
+            backReferenceFields.put(ownerField, childField);
+        }
+
+        private static Field resolveTargetFieldPath(String fieldNameRaw, Class<?> target, String label) {
+            String[] parts = fieldNameRaw.split("\\.");
+
+            Class<?> currentType = target;
+            Field field = null;
+
+            StringBuilder resolvedPath = new StringBuilder(target.getName());
+            Iterator<String> iter = Arrays.asList(parts).iterator();
+
+            while (iter.hasNext()) {
+                String part = iter.next();
+                field = findFieldInHierarchy(currentType, part);
+                if (field == null) {
+                    throw new MappingException(
+                            label + " not found: '" + part +
+                                    "' while resolving path '" + fieldNameRaw +
+                                    "' starting from type " + resolvedPath
+                    );
+                }
+
+                field.setAccessible(true);
+                Class<?> fieldType = field.getType();
+
+                if (iter.hasNext()) {
+                    validateNavigableField(field, fieldType);
+                }
+
+                resolvedPath.append(".").append(part);
+                currentType = fieldType;
+            }
+
+            return field;
+        }
+    }
 
 }
