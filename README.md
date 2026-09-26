@@ -49,7 +49,7 @@ Via [JitPack](https://jitpack.io):
 <dependency>
     <groupId>com.github.DanielTM999</groupId>
     <artifactId>JAutoMapper</artifactId>
-    <version>1.1.0</version>
+    <version>1.2.0</version>
 </dependency>
 ```
 
@@ -567,12 +567,18 @@ Conversores prontos, para usar com `convertField`:
 | Método | Recebe | Devolve |
 |---|---|---|
 | `Converters.first()` | coleção ou array | primeiro elemento não nulo, ou `null` |
-| `Converters.firstMatch(predicate)` | coleção ou array | primeiro que satisfaz o predicado → senão o primeiro elemento → senão `null` |
+| `Converters.firstMatch(predicate)` | coleção ou array | primeiro que satisfaz o predicado → senão `null` |
+| `Converters.firstMatch(predicate, fallback)` | coleção ou array | primeiro que satisfaz o predicado → senão `fallback.get()` |
+| `Converters.firstMatchOrFirst(predicate)` | coleção ou array | primeiro que satisfaz o predicado → senão o primeiro elemento → senão `null` |
 
 ```java
 profile.map("tabelas", "tabelaPrincipal")
        .convertField("tabelaPrincipal", Converters.firstMatch(Tabela::isPrincipal));
 ```
+
+`firstMatch` não tem fallback implícito: se nenhum elemento satisfizer o predicado, o campo recebe `null` (e depois passa pela `NullValuePolicy`). Para voltar ao primeiro elemento, use `firstMatchOrFirst`; para outro valor, use `firstMatch(predicate, fallback)`.
+
+> **Mudança na 1.2.0:** até a 1.1.0, `firstMatch` devolvia o primeiro elemento quando nada casava. Quem dependia disso deve trocar para `firstMatchOrFirst`.
 
 Se o elemento escolhido for de outra classe, ele é mapeado para o tipo do campo (com `nested`, se houver).
 

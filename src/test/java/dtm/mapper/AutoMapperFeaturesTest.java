@@ -748,11 +748,132 @@ public class AutoMapperFeaturesTest {
         MapperConverter<Object, String> first = Converters.first();
 
         assertEquals("b1", firstB.convert(List.of("a1", "b1", "b2")));
-        assertEquals("a1", firstB.convert(List.of("a1", "c1")));
+        assertNull(firstB.convert(List.of("a1", "c1")));
         assertEquals("b1", firstB.convert(new String[]{"a1", "b1"}));
+        assertNull(firstB.convert(new String[]{"a1", "c1"}));
         assertNull(firstB.convert(List.of()));
         assertNull(firstB.convert(null));
         assertEquals("a1", first.convert(List.of("a1", "b1")));
         assertNull(first.convert(List.of()));
+    }
+
+    @Test
+    void firstMatchShouldSkipNullElements() {
+        MapperConverter<Object, String> firstB = Converters.firstMatch((String s) -> s.startsWith("b"));
+        List<String> valores = new ArrayList<>();
+        valores.add(null);
+        valores.add("a1");
+        valores.add(null);
+        valores.add("b1");
+
+        assertEquals("b1", assertDoesNotThrow(() -> firstB.convert(valores)));
+        assertNull(firstB.convert(new ArrayList<>(java.util.Collections.nCopies(3, null))));
+    }
+
+    @Test
+    void firstMatchOrFirstShouldFallBackToFirstElement() {
+        MapperConverter<Object, String> firstBOrFirst = Converters.firstMatchOrFirst((String s) -> s.startsWith("b"));
+
+        assertEquals("b1", firstBOrFirst.convert(List.of("a1", "b1")));
+        assertEquals("a1", firstBOrFirst.convert(List.of("a1", "c1")));
+        assertEquals("a1", firstBOrFirst.convert(new String[]{"a1", "c1"}));
+        assertNull(firstBOrFirst.convert(List.of()));
+        assertNull(firstBOrFirst.convert(null));
+    }
+
+    @Test
+    void firstMatchWithFallbackShouldUseSupplierOnlyWithoutMatch() {
+        MapperConverter<Object, String> firstBOrX = Converters.firstMatch((String s) -> s.startsWith("b"), () -> "x");
+
+        assertEquals("b1", firstBOrX.convert(List.of("a1", "b1")));
+        assertEquals("x", firstBOrX.convert(List.of("a1", "c1")));
+        assertEquals("x", firstBOrX.convert(List.of()));
+        assertEquals("x", firstBOrX.convert(null));
+    }
+
+    @Test
+    void firstMatchShouldRejectNullArguments() {
+        assertThrows(NullPointerException.class, () -> Converters.firstMatch(null));
+        assertThrows(NullPointerException.class, () -> Converters.firstMatch((String s) -> true, null));
+        assertThrows(NullPointerException.class, () -> Converters.firstMatchOrFirst(null));
+    }
+
+    public static class TabelaOrigem {
+        String codigo;
+        boolean principal;
+
+        TabelaOrigem() {}
+
+        TabelaOrigem(String codigo, boolean principal) {
+            this.codigo = codigo;
+            this.principal = principal;
+        }
+
+        boolean isPrincipal() {
+            return principal;
+        }
+    }
+
+    public static class TabelaDestino {
+        String codigo;
+    }
+
+    public static class TabelasOrigem {
+        List<TabelaOrigem> tabelas;
+    }
+
+    public static class TabelaPrincipalEstrita {
+        TabelaDestino tabelaPrincipal;
+        String nome;
+    }
+
+    public static class TabelaPrincipalComFallback {
+        TabelaDestino tabelaPrincipal;
+    }
+
+    @Test
+    void convertFieldWithFirstMatchShouldLeavePojoNullWithoutMatch() {
+        AutoMapper mapper = AutoMapperService.register(
+                TabelasOrigem.class,
+                TabelaPrincipalEstrita.class,
+                profile -> profile
+                        .missingFieldPolicy(MissingFieldPolicy.DEFAULT)
+                        .nullValuePolicy(NullValuePolicy.SET_DEFAULT)
+                        .defaultValue(String.class, () -> "N/I")
+                        .map("tabelas", "tabelaPrincipal")
+                        .convertField("tabelaPrincipal", Converters.firstMatch(TabelaOrigem::isPrincipal))
+        );
+
+        TabelasOrigem semPrincipal = new TabelasOrigem();
+        semPrincipal.tabelas = List.of(new TabelaOrigem("A", false), new TabelaOrigem("B", false));
+
+        TabelaPrincipalEstrita target = mapper.map(semPrincipal, TabelaPrincipalEstrita.class);
+        assertNull(target.tabelaPrincipal);
+        assertEquals("N/I", target.nome);
+
+        TabelasOrigem comPrincipal = new TabelasOrigem();
+        comPrincipal.tabelas = List.of(new TabelaOrigem("A", false), new TabelaOrigem("B", true));
+
+        assertEquals("B", mapper.map(comPrincipal, TabelaPrincipalEstrita.class).tabelaPrincipal.codigo);
+    }
+
+    @Test
+    void convertFieldWithFirstMatchOrFirstShouldMapFirstElementWithoutMatch() {
+        AutoMapper mapper = AutoMapperService.register(
+                TabelasOrigem.class,
+                TabelaPrincipalComFallback.class,
+                profile -> profile
+                        .nullValuePolicy(NullValuePolicy.SET_DEFAULT)
+                        .map("tabelas", "tabelaPrincipal")
+                        .convertField("tabelaPrincipal", Converters.firstMatchOrFirst(TabelaOrigem::isPrincipal))
+        );
+
+        TabelasOrigem source = new TabelasOrigem();
+        source.tabelas = List.of(new TabelaOrigem("A", false), new TabelaOrigem("B", false));
+
+        TabelaPrincipalComFallback target = mapper.map(source, TabelaPrincipalComFallback.class);
+
+        assertNotNull(target.tabelaPrincipal);
+        assertEquals("A", target.tabelaPrincipal.codigo);
     }
 }
