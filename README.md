@@ -49,7 +49,7 @@ Via [JitPack](https://jitpack.io):
 <dependency>
     <groupId>com.github.DanielTM999</groupId>
     <artifactId>JAutoMapper</artifactId>
-    <version>1.0.0</version>
+    <version>1.1.0</version>
 </dependency>
 ```
 
